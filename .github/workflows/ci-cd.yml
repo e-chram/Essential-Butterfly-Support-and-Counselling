@@ -29,6 +29,7 @@ jobs:
           distribution: "temurin"
 
       - name: Build and test with Maven
+        working-directory: ./backend
         run: mvn --batch-mode clean verify
 
   docker:
