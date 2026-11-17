@@ -1,9 +1,11 @@
+
 package ca.sheridancollege.shtirthb.integration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
@@ -11,18 +13,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.LocalDateTime;
-import java.io.ByteArrayOutputStream;
-import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.List;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -41,6 +42,8 @@ import ca.sheridancollege.shtirthb.model.PasswordResetToken;
 import ca.sheridancollege.shtirthb.repository.AdminUserRepository;
 import ca.sheridancollege.shtirthb.repository.ClientUserRepository;
 import ca.sheridancollege.shtirthb.repository.PasswordResetTokenRepository;
+import jakarta.mail.BodyPart;
+import jakarta.mail.Multipart;
 import jakarta.mail.Session;
 import jakarta.mail.internet.MimeMessage;
 
@@ -50,8 +53,8 @@ import jakarta.mail.internet.MimeMessage;
  *   password with the token -> the old password stops working.
  *
  * Real application, real PostgreSQL (Testcontainers), real security rules.
- * The reset token is read straight from the database, so these tests keep
- * working when the link is sent by email instead of being printed.
+ * The reset token is extracted from the mocked outgoing email. The database
+ * stores only its SHA-256 hash.
  * Every test is rolled back at the end.
  */
 @SpringBootTest(properties = {
@@ -82,14 +85,19 @@ class PasswordResetFlowIntegrationTest {
     @Autowired PasswordResetTokenRepository tokens;
     @Autowired PasswordEncoder encoder;
 
-    // Admin login sends an email code, so the mail sender is replaced by a mock.
+    // Email delivery is mocked so the test can inspect the outgoing message.
     @MockitoBean JavaMailSender mailSender;
 
     @BeforeEach
     void setUp() {
         when(mailSender.createMimeMessage())
                 .thenAnswer(call -> new MimeMessage((Session) null));
-        clients.save(new ClientUser("Jane Lee", EMAIL, encoder.encode(OLD_PASSWORD)));
+
+        clients.save(new ClientUser(
+                "Jane Lee",
+                EMAIL,
+                encoder.encode(OLD_PASSWORD)
+        ));
     }
 
     // ---------------------------------------------------------------- helpers
@@ -98,7 +106,11 @@ class PasswordResetFlowIntegrationTest {
         return mvc.perform(post("/api/password/forgot").param("email", email));
     }
 
-    private ResultActions reset(String token, String password, String confirm) throws Exception {
+    private ResultActions reset(
+            String token,
+            String password,
+            String confirm) throws Exception {
+
         return mvc.perform(post("/api/password/reset")
                 .contentType(MediaType.APPLICATION_JSON)
                 .content(String.format(
@@ -109,7 +121,9 @@ class PasswordResetFlowIntegrationTest {
     private ResultActions login(String email, String password) throws Exception {
         return mvc.perform(post("/api/auth/login")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content(String.format("{\"email\":\"%s\",\"password\":\"%s\"}", email, password)));
+                .content(String.format(
+                        "{\"email\":\"%s\",\"password\":\"%s\"}",
+                        email, password)));
     }
 
     private PasswordResetToken onlyToken() {
@@ -118,37 +132,83 @@ class PasswordResetFlowIntegrationTest {
         return all.get(0);
     }
 
-    /** Captures the development reset link; the database stores only its SHA-256 hash. */
     private String requestedClientToken() throws Exception {
         return requestedToken(EMAIL);
     }
 
+    /**
+     * Requests a password reset, captures the outgoing email and extracts
+     * the raw token from its reset-password link.
+     */
     private String requestedToken(String email) throws Exception {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        PrintStream original = System.out;
-        try {
-            System.setOut(new PrintStream(output, true, StandardCharsets.UTF_8));
-            forgot(email).andExpect(status().isOk());
-        } finally {
-            System.setOut(original);
+        forgot(email)
+                .andExpect(status().isOk())
+                .andExpect(content().string(GENERIC_ANSWER));
+
+        ArgumentCaptor<MimeMessage> messageCaptor =
+                ArgumentCaptor.forClass(MimeMessage.class);
+
+        verify(mailSender).send(messageCaptor.capture());
+
+        MimeMessage sentMessage = messageCaptor.getValue();
+
+        String emailContent = extractText(sentMessage.getContent());
+
+        Matcher matcher = Pattern.compile(
+                "/reset-password\\?token=([a-f0-9-]+)"
+        ).matcher(emailContent);
+
+        if (!matcher.find()) {
+            throw new AssertionError(
+                    "Password reset token was not found in the outgoing email."
+            );
         }
-        Matcher matcher = Pattern.compile("Reset link: .*?/reset-password\\?token=([a-f0-9-]+)")
-                .matcher(output.toString(StandardCharsets.UTF_8));
-        if (!matcher.find()) throw new AssertionError("Reset link was not printed by PasswordResetService");
+
         return matcher.group(1);
+    }
+
+    /**
+     * Extracts text recursively from plain-text, HTML and multipart email
+     * content. This supports the multipart message created by
+     * PasswordResetMailService.
+     */
+    private String extractText(Object content) throws Exception {
+
+        if (content instanceof String text) {
+            return text;
+        }
+
+        if (content instanceof Multipart multipart) {
+            StringBuilder result = new StringBuilder();
+
+            for (int i = 0; i < multipart.getCount(); i++) {
+                BodyPart bodyPart = multipart.getBodyPart(i);
+                result.append(extractText(bodyPart.getContent()));
+                result.append('\n');
+            }
+
+            return result.toString();
+        }
+
+        return "";
     }
 
     private static String hash(String value) {
         try {
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                    .digest(value.getBytes(StandardCharsets.UTF_8)));
+            return HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(value.getBytes(StandardCharsets.UTF_8))
+            );
         } catch (NoSuchAlgorithmException ex) {
             throw new IllegalStateException(ex);
         }
     }
 
     private boolean clientPasswordIs(String password) {
-        return encoder.matches(password, clients.findByEmail(EMAIL).orElseThrow().getPassword());
+        return encoder.matches(
+                password,
+                clients.findByEmail(EMAIL).orElseThrow().getPassword()
+        );
     }
 
     // -------------------------------------------------------- asking for a reset
@@ -161,6 +221,7 @@ class PasswordResetFlowIntegrationTest {
 
         PasswordResetToken token = onlyToken();
         Long clientId = clients.findByEmail(EMAIL).orElseThrow().getId();
+
         assertEquals("CLIENT", token.getUserType());
         assertEquals(clientId, token.getClientUser().getId());
         assertEquals(64, token.getTokenHash().length());
@@ -200,6 +261,7 @@ class PasswordResetFlowIntegrationTest {
         forgot("admin@test.com").andExpect(status().isOk());
 
         PasswordResetToken token = onlyToken();
+
         assertEquals("ADMIN", token.getUserType());
         assertEquals(admin.getId(), token.getAdminUser().getId());
     }
@@ -220,7 +282,9 @@ class PasswordResetFlowIntegrationTest {
     @Test
     void afterTheReset_theOldPasswordNoLongerWorks() throws Exception {
         String token = requestedClientToken();
-        reset(token, NEW_PASSWORD, NEW_PASSWORD).andExpect(status().isOk());
+
+        reset(token, NEW_PASSWORD, NEW_PASSWORD)
+                .andExpect(status().isOk());
 
         login(EMAIL, OLD_PASSWORD).andExpect(status().isUnauthorized());
     }
@@ -228,9 +292,12 @@ class PasswordResetFlowIntegrationTest {
     @Test
     void theNewPassword_isStoredHashed() throws Exception {
         String token = requestedClientToken();
-        reset(token, NEW_PASSWORD, NEW_PASSWORD).andExpect(status().isOk());
+
+        reset(token, NEW_PASSWORD, NEW_PASSWORD)
+                .andExpect(status().isOk());
 
         String stored = clients.findByEmail(EMAIL).orElseThrow().getPassword();
+
         assertFalse(NEW_PASSWORD.equals(stored));
         assertTrue(encoder.matches(NEW_PASSWORD, stored));
     }
@@ -238,12 +305,17 @@ class PasswordResetFlowIntegrationTest {
     @Test
     void aToken_canOnlyBeUsedOnce() throws Exception {
         String token = requestedClientToken();
-        reset(token, NEW_PASSWORD, NEW_PASSWORD).andExpect(status().isOk());
+
+        reset(token, NEW_PASSWORD, NEW_PASSWORD)
+                .andExpect(status().isOk());
+
         assertTrue(onlyToken().isUsed());
 
         reset(token, "AnotherPass1", "AnotherPass1")
                 .andExpect(status().isBadRequest())
-                .andExpect(content().string("Invalid, expired, or already used reset token."));
+                .andExpect(content().string(
+                        "Invalid, expired, or already used reset token."
+                ));
 
         assertTrue(clientPasswordIs(NEW_PASSWORD));
     }
@@ -252,7 +324,9 @@ class PasswordResetFlowIntegrationTest {
     void anUnknownToken_isRejected() throws Exception {
         reset("not-a-real-token", NEW_PASSWORD, NEW_PASSWORD)
                 .andExpect(status().isBadRequest())
-                .andExpect(content().string("Invalid, expired, or already used reset token."));
+                .andExpect(content().string(
+                        "Invalid, expired, or already used reset token."
+                ));
 
         assertTrue(clientPasswordIs(OLD_PASSWORD));
     }
@@ -264,27 +338,28 @@ class PasswordResetFlowIntegrationTest {
         LocalDateTime now = LocalDateTime.now();
 
         PasswordResetToken expiredToken = PasswordResetToken.forClient(
-            hash("expired-token"),
-            client,
-            now.minusMinutes(1)
-    );
+                hash("expired-token"),
+                client,
+                now.minusMinutes(1)
+        );
 
         // The expiry must be after creation, even though both are in the past.
         ReflectionTestUtils.setField(
-            expiredToken,
-            "createdAt",
-            now.minusHours(1)
-    );
+                expiredToken,
+                "createdAt",
+                now.minusHours(1)
+        );
 
         tokens.saveAndFlush(expiredToken);
 
         reset("expired-token", NEW_PASSWORD, NEW_PASSWORD)
-            .andExpect(status().isBadRequest())
-            .andExpect(content().string(
-                    "Invalid, expired, or already used reset token."));
+                .andExpect(status().isBadRequest())
+                .andExpect(content().string(
+                        "Invalid, expired, or already used reset token."
+                ));
 
-    assertTrue(clientPasswordIs(OLD_PASSWORD));
-}
+        assertTrue(clientPasswordIs(OLD_PASSWORD));
+    }
 
     @Test
     void passwordsThatDoNotMatch_changeNothingAndKeepTheTokenUsable() throws Exception {
@@ -298,14 +373,16 @@ class PasswordResetFlowIntegrationTest {
         assertFalse(onlyToken().isUsed());
 
         // The user can still finish the reset with the same token.
-        reset(token, NEW_PASSWORD, NEW_PASSWORD).andExpect(status().isOk());
+        reset(token, NEW_PASSWORD, NEW_PASSWORD)
+                .andExpect(status().isOk());
     }
 
     @Test
     void aShortPassword_isRejectedAndKeepsTheTokenUsable() throws Exception {
         String token = requestedClientToken();
 
-        reset(token, "short1", "short1").andExpect(status().isBadRequest());
+        reset(token, "short1", "short1")
+                .andExpect(status().isBadRequest());
 
         assertTrue(clientPasswordIs(OLD_PASSWORD));
         assertFalse(onlyToken().isUsed());
@@ -324,14 +401,18 @@ class PasswordResetFlowIntegrationTest {
     @Test
     void anAdminReset_clearsTheLoginLockAndTheNewPasswordWorks() throws Exception {
         AdminUser admin = admins.findByEmail("admin@test.com").orElseThrow();
+
         admin.setFailedLoginAttempts(5);
         admin.setLockedUntil(LocalDateTime.now().plusMinutes(15));
         admins.save(admin);
 
         String token = requestedToken("admin@test.com");
-        reset(token, NEW_PASSWORD, NEW_PASSWORD).andExpect(status().isOk());
+
+        reset(token, NEW_PASSWORD, NEW_PASSWORD)
+                .andExpect(status().isOk());
 
         AdminUser after = admins.findByEmail("admin@test.com").orElseThrow();
+
         assertEquals(0, after.getFailedLoginAttempts());
         assertNull(after.getLockedUntil());
 
